@@ -2,9 +2,20 @@ from openai import OpenAI
 import json
 import os
 from dotenv import load_dotenv
+from models import ContextLLMModel
+from collections import defaultdict
+
+from fastapi import FastAPI
+from sqlalchemy import select
+app = FastAPI()
+from telegram import telegram_client
+from database import db
+from constants import TELEGRAM_MESSAGE_ANALYSIS_PROMPT
+from models import TelegramMessageModel,ContextLLMModel,MessageSchedulerModel,UserModel
+import json,re
+
 
 load_dotenv()
-import json, re
 
 def parse_llm_response(raw: str) -> dict:
     # Strip markdown code fences if present
@@ -21,58 +32,11 @@ def analyze_messages_with_llm(messages):
     messages: list of dicts -> [{"msg_id": int, "text": str}]
     llm_call_fn: function that takes prompt and returns LLM response (string)
     """
-    # Step 1: format messages
     formatted_msgs = "\n".join(
-        [f"{m['msg_id']}: {m['text']}" for m in messages[5:]]
+        [f"{m['msg_id']}: {m['text']}" for m in messages]
     )
-
-    # Step 2: prompt
-    prompt = f"""
-You are a strict JSON generator.
-
-Analyze the messages and determine:
-
-1. Whether ANY subset forms:
-   - PROJECT REQUIREMENT
-   - JOB APPLICATION
-
-2. If found:
-   - Store all msg ids(it must be string) which had relevance in a list in the variable relevant_messages
-   - Generate a short summary
-
-3. If none found:
-   - relevant_messages = null
-
-Definitions:
-- PROJECT REQUIREMENT: building apps, features, tech work
-- JOB APPLICATION: resume, hiring, jobs, engineers needed
-
-Output format:
-{{
-  "relevant_messages": list or empty list,
-  "summary": "string",
-  "is_project": true or false,
-  "is_job_application": true or false
-}}
-
-Rules:
-- Output ONLY JSON
-- Use double quotes
-- No extra text
-
-Messages:
-{formatted_msgs}
-
-IMPORTANT: Return ONLY the raw JSON object. No explanation, no markdown code blocks, no preamble. Start your response with '{' and end with '}'.
-
-"""
-
-
-
-    # Step 3: call LLM
+    prompt = TELEGRAM_MESSAGE_ANALYSIS_PROMPT.format(formatted_msgs)
     response = llm_call_fn(prompt)
-
-    # Step 4: parse JSON safely
     return response
 
 
@@ -83,7 +47,6 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-import json
 
 def llm_call_fn(prompt):
     response = client.chat.completions.create(
@@ -101,3 +64,95 @@ def llm_call_fn(prompt):
     raw = response.choices[0].message.content
     return parse_llm_response(raw)  # use defensive parser above
 
+
+
+def context_scheduler_insertion(grouped):
+    context_objects_list = []
+    offset = 0
+    total_count = 0
+    for user in grouped.keys():
+        llm_req_list = []
+        group_id = None
+        for message in grouped[user]:
+            if offset!=0 and offset%5==0:
+                llm_resp = analyze_messages_with_llm(llm_req_list)
+                if not llm_resp['is_project'] and not llm_resp['is_job_application']:
+                    offset+=1
+                    continue
+                llm_req_list = []
+                group_id = message.group_id
+                relevant_messages = ','.join(llm_resp['relevant_messages']) if isinstance(llm_resp['relevant_messages'], list) else llm_resp['relevant_messages']
+                context_object = ContextLLMModel(user_id=user,group_id=group_id,is_project=llm_resp['is_project'], is_job_application=llm_resp["is_job_application"], relevant_messages=relevant_messages, summary = llm_resp['summary'])
+                total_count+=1
+                context_objects_list.append(context_object)
+            msg_obj = {
+                "msg_id": message.message_id,
+                "text": message.text
+            }
+            llm_req_list.append(msg_obj)
+            offset+=1
+    return context_objects_list,total_count
+
+def get_grouped_messages():
+    last_offset = db.query(MessageSchedulerModel).filter_by(
+        scheduler_name="context_fetch").first().offset
+    result = db.execute(
+    select(TelegramMessageModel).where(
+        TelegramMessageModel.message_id > last_offset
+    )
+)
+    messages = result.scalars().all()
+    grouped = defaultdict(list)
+    latest_msg_id = 0
+    for message in messages:
+        latest_msg_id = message.message_id
+        grouped[message.user_id].append(message)
+    
+    return latest_msg_id,grouped
+
+def get_messages_from_telegram(source_entity):
+    last_offset = db.query(MessageSchedulerModel).filter_by(
+        scheduler_name="messages_fetch").first().offset
+    if last_offset == 0:
+        iterator = telegram_client.iter_messages(source_entity, reverse=True)
+    else:
+        iterator = telegram_client.iter_messages(
+            source_entity,
+            reverse=True,
+            min_id=last_offset
+        )
+    return iterator
+
+def insert_new_user(user,user_ids):
+    user_obj = UserModel(
+    username=user.username,
+    first_name=user.first_name,
+    last_name=user.last_name,
+    user_id=int(user.id)
+)
+    db.add(user_obj)
+    user_ids.append(user.id)
+    db.commit()
+    return user_ids
+
+async def iterate_message_to_insert_in_db(messages,message_list,user_ids):
+    latest_msg_id = 0
+    async for message in messages:
+        if message.text is None or not len(message.text):
+            continue
+        chat = await message.get_chat()
+        user = await telegram_client.get_entity(message.sender_id)
+
+        if message.sender_id not in user_ids:
+            user_ids = insert_new_user(user,user_ids)
+        latest_msg_id = message.id
+        message_obj = TelegramMessageModel(
+            message_id=int(message.id),
+            text=message.text,
+            group_id=int(chat.id),
+            channel_name="telegram",
+            group_name=chat.title,
+            user_id=int(message.sender_id)
+        )
+        message_list.append(message_obj)
+    return message_list,latest_msg_id
