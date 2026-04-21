@@ -18,11 +18,19 @@ class BaseModel():
 class UserModel(BaseModel,Base):
     __tablename__ = "sb_telegram_users"
 
-    id = Column(BigInteger, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True)
     username = Column(String(100), nullable=True)
     first_name = Column(String(100), nullable=True)
     last_name = Column(String(100), nullable=True)
-    user_id = Column(Integer, unique=True, index=True)
+    user_id = Column(BigInteger, unique=True, index=True)
+
+class GroupModel(BaseModel, Base):
+    __tablename__ = "sb_telegram_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, unique=True)
+    group_name = Column(String(500))
+
 
 class TelegramMessageModel(BaseModel,Base):
     __tablename__ = "sb_telegram_messages"
@@ -42,7 +50,7 @@ class MessageSchedulerModel(Base):
     last_scheduler_date = Column(DateTime)
     offset = Column(Integer)
     scheduler_name = Column(String(100), unique=True, index=True)
-
+    group_id = Column(BigInteger)
 
 class ContextLLMModel(BaseModel,Base):
     __tablename__ = "sb_context_llm"

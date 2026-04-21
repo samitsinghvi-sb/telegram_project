@@ -36,3 +36,9 @@ Messages:
 
 IMPORTANT: Return ONLY the raw JSON object. No explanation, no markdown code blocks, no preamble. Start your response with '{{' and end with '}}'.
 """
+
+
+group_ids = {
+      "MBM CSE Alumni Group": -1001318801474,
+      "PAN IIT Alumni Group": -1001458595201
+}
