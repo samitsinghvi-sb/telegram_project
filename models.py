@@ -41,7 +41,6 @@ class TelegramMessageModel(BaseModel,Base):
     group_id = Column(BigInteger)
     channel_name = Column(String(100))
     text = Column(String(1000))
-    group_name = Column(String(500))
 
 class MessageSchedulerModel(Base):
     __tablename__ = "sb_scheduler_master"

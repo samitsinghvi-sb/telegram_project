@@ -155,6 +155,8 @@ def insert_new_user(user,user_ids,user_objects_list):
 async def iterate_message_to_insert_in_db(messages,message_list,group_id):
     latest_msg_id = 0
     user_objects_list = []
+    all_groups = db.query(GroupModel).all()
+    group_ids = [group.group_id for group in all_groups]
     user_ids = db.query(UserModel.user_id).all()
     user_ids = [uid[0] for uid in user_ids]
     async for message in messages:
@@ -163,6 +165,15 @@ async def iterate_message_to_insert_in_db(messages,message_list,group_id):
         chat = await message.get_chat()
         user = await telegram_client.get_entity(message.sender_id)
 
+        group_exist = group_id in group_ids
+        if not group_exist:
+            group_obj = GroupModel(
+                group_id=group_id,
+                group_name=chat.title if chat.title else "Unknown"
+            )
+            db.add(group_obj)
+            db.commit()
+            group_ids.append(group_id)
         if message.sender_id not in user_ids:
             user_ids,user_objects_list = insert_new_user(user,user_ids,user_objects_list)
         latest_msg_id = message.id
@@ -171,7 +182,6 @@ async def iterate_message_to_insert_in_db(messages,message_list,group_id):
             text=message.text,
             group_id=int(group_id),
             channel_name="telegram",
-            group_name=chat.title,
             user_id=int(message.sender_id)
         )
         message_list.append(message_obj)
