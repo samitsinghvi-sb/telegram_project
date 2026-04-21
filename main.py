@@ -1,23 +1,15 @@
 import asyncio
-from collections import defaultdict
-
 from fastapi import FastAPI
-from sqlalchemy import select
-app = FastAPI()
 from telegram import telegram_client
 from database import db
 from datetime import datetime
-from models import TelegramMessageModel, UserModel, MessageSchedulerModel,ContextLLMModel
-from helper import analyze_messages_with_llm,context_scheduler_insertion,get_grouped_messages,get_messages_from_telegram,insert_new_user,iterate_message_to_insert_in_db,GroupEnum
+from models import TelegramMessageModel, UserModel, MessageSchedulerModel
+from helper import context_scheduler_insertion,get_grouped_messages,iterate_message_to_insert_in_db,GroupEnum,scheduler_updation_with_latest_offset
 from constants import group_ids
 
+app = FastAPI()
+
 otp_store = {}
-
-
-@app.on_event("startup")
-async def startup():
-    await telegram_client.connect()
-
 
 @app.post("/send_otp")
 async def send_otp(phone_number: str):
@@ -49,32 +41,22 @@ async def login(phone_number: str, otp: str):
 
 @app.get('/fetch_messages')
 async def fetch_messages(group_name : GroupEnum ):
+    """Fetch messages from a Telegram group and store them in the database."""
     await telegram_client.connect()
-    #the below line is used to connect to a particular group so that we can fetch messages from it
     group_id = group_ids.get(group_name.value)
     if not group_id:
         return {"error": "Invalid group name"}
-    source_entity = await telegram_client.get_entity(group_id)
-    message_list = []
-    latest_msg_id = 0
-    messages = get_messages_from_telegram(source_entity,group_id)
-    message_list,latest_msg_id = await iterate_message_to_insert_in_db(message_list=message_list,messages=messages,group_id=group_id)
-    scheduler_obj = db.query(MessageSchedulerModel).filter_by(scheduler_name="messages_fetch", group_id=group_id).first()
-    if not scheduler_obj:
-        scheduler_obj = MessageSchedulerModel(
-            scheduler_name="messages_fetch",
-            group_id=group_id,
-        )
-        db.add(scheduler_obj)
-    scheduler_obj.last_scheduler_date = datetime.now()
-    scheduler_obj.offset = latest_msg_id
+    message_list,latest_msg_id,user_objects_list = await iterate_message_to_insert_in_db(group_id=group_id)
+    scheduler_updation_with_latest_offset(group_id,latest_msg_id)
     db.bulk_save_objects(message_list)
+    db.bulk_save_objects(user_objects_list)
     db.commit()
     return {"message": f"Fetched {len(message_list)} messages from {group_name.value} group"}
 
 
 @app.get('/context_scheduler')
 async def context_scheduler(group_name : GroupEnum):
+    """"API to fetch messages from database, analyze with LLM and store the relevant contexts in another table."""
     group_id = group_ids.get(group_name.value)
     latest_msg_id,grouped_messages = get_grouped_messages(group_id)
     context_objects_list,total_count = context_scheduler_insertion(grouped_messages,group_id)

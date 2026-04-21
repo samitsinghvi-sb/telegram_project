@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from openai import OpenAI
 import json
 import os
@@ -72,6 +74,8 @@ def llm_call_fn(prompt):
     raw = response.choices[0].message.content
     return parse_llm_response(raw)  # use defensive parser above
 
+def get_relevant_messages(llm_resp):
+    return ','.join(llm_resp['relevant_messages']) if isinstance(llm_resp['relevant_messages'], list) else llm_resp['relevant_messages']
 
 
 def context_scheduler_insertion(grouped,group_id):
@@ -87,7 +91,7 @@ def context_scheduler_insertion(grouped,group_id):
                     offset+=1
                     continue
                 llm_req_list = []
-                relevant_messages = ','.join(llm_resp['relevant_messages']) if isinstance(llm_resp['relevant_messages'], list) else llm_resp['relevant_messages']
+                relevant_messages = get_relevant_messages(llm_resp)
                 context_object = ContextLLMModel(user_id=user,group_id=group_id,is_project=llm_resp['is_project'], is_job_application=llm_resp["is_job_application"], relevant_messages=relevant_messages, summary = llm_resp['summary'])
                 total_count+=1
                 context_objects_list.append(context_object)
@@ -126,7 +130,8 @@ def get_grouped_messages(group_id):
     
     return latest_msg_id,grouped
 
-def get_messages_from_telegram(source_entity,group_id):
+async def get_messages_from_telegram(group_id):
+    source_entity = await telegram_client.get_entity(group_id)
     scheduler_obj = db.query(MessageSchedulerModel).filter_by(
         scheduler_name="messages_fetch", group_id=group_id).first()
     last_offset = scheduler_obj.offset if scheduler_obj else 0
@@ -152,31 +157,41 @@ def insert_new_user(user,user_ids,user_objects_list):
     user_objects_list.append(user_obj)
     return user_ids,user_objects_list
 
-async def iterate_message_to_insert_in_db(messages,message_list,group_id):
+def insert_new_group(group_id,group_name,group_ids):
+    group_obj = GroupModel(
+        group_id=group_id,
+        group_name=group_name
+    )
+    db.add(group_obj)
+    db.commit()
+    group_ids.append(group_id)
+    return group_ids
+
+async def iterate_message_to_insert_in_db(group_id):
+    """Iterate through messages fetched from Telegram, create message objects for database insertion, and track the latest message ID."""
     latest_msg_id = 0
     user_objects_list = []
+    message_list = []
+    #getting existing users and groups to avoid duplication
     all_groups = db.query(GroupModel).all()
     group_ids = [group.group_id for group in all_groups]
     user_ids = db.query(UserModel.user_id).all()
     user_ids = [uid[0] for uid in user_ids]
+    #iterating through messagses
+    messages = await get_messages_from_telegram(group_id)
     async for message in messages:
         if message.text is None or not len(message.text) or not message.sender_id:
             continue
         chat = await message.get_chat()
+        group_name = chat.title if chat.title else "Unknown Group"
         user = await telegram_client.get_entity(message.sender_id)
-
-        group_exist = group_id in group_ids
-        if not group_exist:
-            group_obj = GroupModel(
-                group_id=group_id,
-                group_name=chat.title if chat.title else "Unknown"
-            )
-            db.add(group_obj)
-            db.commit()
-            group_ids.append(group_id)
+        #inserting new users and groups those which don't exist  in db yet
+        if group_id not in group_ids:
+            group_ids = insert_new_group(group_id,group_name,group_ids)
         if message.sender_id not in user_ids:
             user_ids,user_objects_list = insert_new_user(user,user_ids,user_objects_list)
         latest_msg_id = message.id
+        #storing msg objects in a list for bulk upload
         message_obj = TelegramMessageModel(
             message_id=int(message.id),
             text=message.text,
@@ -185,6 +200,15 @@ async def iterate_message_to_insert_in_db(messages,message_list,group_id):
             user_id=int(message.sender_id)
         )
         message_list.append(message_obj)
-    db.bulk_save_objects(user_objects_list)
-    db.commit()
-    return message_list,latest_msg_id
+    return message_list,latest_msg_id,user_objects_list
+
+def scheduler_updation_with_latest_offset(group_id, latest_msg_id):
+    scheduler_obj = db.query(MessageSchedulerModel).filter_by(scheduler_name="messages_fetch", group_id=group_id).first()
+    if not scheduler_obj:
+        scheduler_obj = MessageSchedulerModel(
+            scheduler_name="messages_fetch",
+            group_id=group_id,
+        )
+        db.add(scheduler_obj)
+    scheduler_obj.last_scheduler_date = datetime.now()
+    scheduler_obj.offset = latest_msg_id
